@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bevy::app::{App, Plugin, PostUpdate};
+use bevy::app::{App, Plugin, PostUpdate, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
@@ -97,6 +97,7 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
+        app.add_systems(Update, detect_focus_rejection);
         app.add_systems(
             PostUpdate,
             (
@@ -110,7 +111,6 @@ impl Plugin for FocusEventsPlugin {
         app.add_observer(dim_remove_window_trigger)
             .add_observer(dim_window_trigger)
             .add_observer(maintain_focus_singleton)
-            .add_observer(detect_focus_rejection)
             .add_observer(virtual_strip_activated)
             .add_observer(stray_focus_observer)
             .add_observer(focus_window_trigger)
@@ -151,23 +151,23 @@ fn maintain_focus_singleton(
     config.set_ffm_flag(None);
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
 fn detect_focus_rejection(
-    trigger: On<Add, FocusedMarker>,
+    focused: Single<Entity, Added<FocusedMarker>>,
     mut focus_history: ResMut<FocusHistory>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     mut commands: Commands,
 ) {
-    let actual_entity = trigger.entity;
     let Some(target_entity) = focus_history.pending_focus.take() else {
         return;
     };
-    if actual_entity == target_entity {
+    if *focused == target_entity {
         return;
     }
 
     debug!(
-        "focus rejection detected: requested {target_entity}, got {actual_entity}. Floating {target_entity}."
+        "focus rejection detected: requested {target_entity}, got {}. Floating {target_entity}.",
+        *focused
     );
     if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
         entity_commands.try_insert(Unmanaged::Floating);
@@ -177,7 +177,6 @@ fn detect_focus_rejection(
             strip.remove(target_entity);
         }
     }
-    // commands.reshuffle_around(actual_entity);
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -521,10 +520,11 @@ mod tests {
         };
         world.insert_resource(history);
 
-        world.add_observer(detect_focus_rejection);
+        let system_id = world.register_system(detect_focus_rejection);
 
         // Focus arrives on actual instead of requested target
         world.entity_mut(actual).insert(FocusedMarker);
+        _ = world.run_system(system_id);
 
         assert!(
             world
