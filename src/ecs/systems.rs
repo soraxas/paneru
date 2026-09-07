@@ -83,8 +83,14 @@ type ResizableWindows<'w, 's> = Query<
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
-const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 500;
-const LOOP_MAX_TIMEOUT_MS: u32 = 50;
+const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
+// Real events (input, IPC, workspace changes, ...) wake the pump immediately
+// via `EventLoopWaker`, so this only bounds how late the free-running 1s
+// `on_timer` systems (`recover_lost_focus`, workspace refresh) can land, and
+// how long a dead event tap can go unnoticed between the 30s health sweeps.
+// Kept well under both: with no genuine work to do, this used to run the
+// whole schedule 20 times a second.
+const LOOP_MAX_TIMEOUT_MS: u32 = 500;
 const TAP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const LOOP_TIMEOUT_STEP: u32 = 1;
 
