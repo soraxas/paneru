@@ -151,17 +151,74 @@ fn maintain_focus_singleton(
     config.set_ffm_flag(None);
 }
 
+/// Whether two windows are members of one native tab group: the app shows one
+/// of them at a time, and focusing any of them can leave the focus on the one
+/// the app decided to show.
+///
+/// The strip knows the ones it has already grouped. The rest are recognised the
+/// same way [`super::systems::detect_tabbed_windows`] recognises them in the
+/// first place: same app, same frame.
+fn shares_a_tab_group(
+    workspaces: &Query<(Entity, &mut LayoutStrip)>,
+    windows: &Windows,
+    target: Entity,
+    actual: Entity,
+) -> bool {
+    if workspaces.iter().any(|(_, strip)| {
+        strip
+            .tab_group(target)
+            .is_some_and(|group| group.contains(&actual))
+    }) {
+        return true;
+    }
+
+    let parent_of = |entity: Entity| {
+        windows
+            .get(entity)
+            .and_then(|window| windows.find_parent(window.id()))
+            .map(|(_, _, parent)| parent)
+    };
+    let (Some(target_app), Some(actual_app)) = (parent_of(target), parent_of(actual)) else {
+        return false;
+    };
+    if target_app != actual_app {
+        return false;
+    }
+
+    windows
+        .frame(target)
+        .zip(windows.frame(actual))
+        .is_some_and(|(target_frame, actual_frame)| {
+            target_frame.min.chebyshev_distance(actual_frame.min) <= 1
+                && target_frame.size().chebyshev_distance(actual_frame.size()) <= 1
+        })
+}
+
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
 fn detect_focus_rejection(
     focused: Single<Entity, Added<FocusedMarker>>,
     mut focus_history: ResMut<FocusHistory>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
+    windows: Windows,
     mut commands: Commands,
 ) {
     let Some(target_entity) = focus_history.pending_focus.take() else {
         return;
     };
     if *focused == target_entity {
+        return;
+    }
+
+    // Native tabs share one slot: asking for a background tab makes the app
+    // select it, and the focus notification names whichever tab of the group
+    // the app ended up showing. That is the app doing what was asked, not
+    // refusing it — floating the window here is how a tabbed terminal ends up
+    // scattered across the layout as windows nothing tiles.
+    if shares_a_tab_group(&workspaces, &windows, target_entity, *focused) {
+        debug!(
+            "focus landed on tab sibling {} of {target_entity}; not a rejection.",
+            *focused
+        );
         return;
     }
 
@@ -501,6 +558,43 @@ mod tests {
         history.forget_workspace(1);
 
         assert_eq!(history.last_managed(1), None);
+    }
+
+    /// Native tabs share a slot: the app answering with a sibling of the tab
+    /// group is it doing what was asked, so the requested window must keep its
+    /// place in the layout.
+    #[test]
+    fn focus_landing_on_a_tab_sibling_is_not_a_rejection() {
+        let mut world = World::new();
+        let target = world.spawn(()).id();
+        let sibling = world.spawn(()).id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(target);
+        strip
+            .convert_to_tabs(target, sibling)
+            .expect("target is in the strip");
+        world.spawn(strip);
+
+        world.insert_resource(FocusHistory {
+            pending_focus: Some(target),
+            ..Default::default()
+        });
+        let system_id = world.register_system(detect_focus_rejection);
+
+        world.entity_mut(sibling).insert(FocusedMarker);
+        _ = world.run_system(system_id);
+
+        assert!(
+            world.get::<Unmanaged>(target).is_none(),
+            "a tab sibling taking the focus must not float the requested tab"
+        );
+        let mut strips = world.query::<&LayoutStrip>();
+        assert!(
+            strips.single(&world).expect("one strip").contains(target),
+            "and must not take it out of the layout"
+        );
+        assert_eq!(world.resource::<FocusHistory>().pending_focus, None);
     }
 
     #[test]

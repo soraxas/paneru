@@ -204,6 +204,7 @@ pub(super) fn theme_change_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
@@ -235,6 +236,39 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
+        // Guard against stale focus events: a delayed one (from
+        // RetryFrontSwitch or a dont_focus re-assertion) must not pull
+        // FocusedMarker back after focus has moved to another app.
+        if !app.is_frontmost() {
+            continue;
+        }
+
+        // Within the app, the window it says is focused wins over the id the
+        // event carries, which may be a moment out of date. An app with native
+        // tabs in particular answers with whichever member of the tab group it
+        // decided to show. Follow it to that window rather than dropping the
+        // event: dropping it leaves the strip parked where it was, so Cmd-Tab
+        // into a tabbed terminal looks like nothing happened.
+        let (window, entity, window_id) = match app.focused_window_id() {
+            Ok(current) if current != window_id => {
+                match ctx.windows.find_parent(current) {
+                    Some((current_window, current_entity, current_parent))
+                        if current_parent == parent =>
+                    {
+                        debug!(
+                            "app {} reports window {current} focused, not {window_id}; following it",
+                            app.name()
+                        );
+                        (current_window, current_entity, current)
+                    }
+                    // Nothing we track answers to that id, so the event really
+                    // is stale.
+                    _ => continue,
+                }
+            }
+            _ => (window, entity, window_id),
+        };
+
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
         // remain stale from a previously focused window.
@@ -244,20 +278,6 @@ pub(super) fn window_focused_trigger(
             .windows
             .focused()
             .is_some_and(|(focused, _)| focused.id() == window_id);
-
-        // Guard against stale focus events. Without these checks, delayed
-        // events (e.g. from RetryFrontSwitch or dont_focus re-assertions)
-        // can pull FocusedMarker back to an old window after focus has moved on.
-        //
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
-            continue;
-        }
-        if app.focused_window_id().is_ok_and(|id| id != window_id) {
-            continue;
-        }
 
         let managed = ctx
             .windows
