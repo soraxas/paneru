@@ -19,13 +19,13 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
+use crate::ecs::workspace::{ParkedFloat, RestoreFocusMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, Scrolling, SendMessageTrigger,
     SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Window, WindowManager};
+use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -97,7 +97,10 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
-        app.add_systems(Update, detect_focus_rejection);
+        app.add_systems(
+            Update,
+            (detect_focus_rejection, recover_offscreen_focused_float),
+        );
         app.add_systems(
             PostUpdate,
             (
@@ -230,9 +233,65 @@ fn detect_focus_rejection(
         entity_commands.try_insert(Unmanaged::Floating);
     }
     for (_, mut strip) in &mut workspaces {
-        if strip.contains(target_entity) {
-            strip.remove(target_entity);
+        if strip.holds(target_entity) {
+            strip.detach(target_entity);
         }
+    }
+}
+
+/// How much of a window has to be showing for it to count as reachable.
+const RECOVERABLE_SLIVER: i32 = 20;
+
+/// Brings a floating window that has taken focus back onto the screen when it
+/// is not on any display at all.
+///
+/// A float has no slot in the layout, so nothing else moves it: one stranded
+/// off screen — parked with a row that has since been reaped, left behind by an
+/// app that reopened it where it was last session — takes focus on Cmd-Tab and
+/// stays invisible, which reads as the switch simply not working. A float
+/// parked with its own hidden row is off screen on purpose and is left to the
+/// row logic, which puts it back when the row is shown.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn recover_offscreen_focused_float(
+    focused_windows: Query<Entity, Added<FocusedMarker>>,
+    parked: Query<&ParkedFloat>,
+    displays: Query<&Display>,
+    active_display: ActiveDisplay,
+    mut ctx: WindowCtx,
+) {
+    for entity in &focused_windows {
+        let Some((_, _, Some(Unmanaged::Floating))) = ctx.windows.get_managed(entity) else {
+            continue;
+        };
+        if parked.get(entity).is_ok() {
+            continue;
+        }
+        let Some(frame) = ctx.windows.moving_frame(entity) else {
+            continue;
+        };
+
+        let reachable = displays.iter().any(|display| {
+            let showing = display.bounds().intersect(frame);
+            showing.width() >= RECOVERABLE_SLIVER && showing.height() >= RECOVERABLE_SLIVER
+        });
+        if reachable {
+            continue;
+        }
+
+        let bounds = active_display.bounds();
+        let size = frame.size();
+        let origin = Origin::new(
+            frame
+                .min
+                .x
+                .clamp(bounds.min.x, (bounds.max.x - size.x).max(bounds.min.x)),
+            frame
+                .min
+                .y
+                .clamp(bounds.min.y, (bounds.max.y - size.y).max(bounds.min.y)),
+        );
+        debug!("focused float {entity} was off screen at {frame:?}; recovering to {origin}");
+        ctx.commands.reposition_entity(entity, origin);
     }
 }
 

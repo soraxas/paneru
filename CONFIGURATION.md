@@ -222,6 +222,14 @@ around at the start or the end.
 
 Moving the last window out of the virtual row, will "collapse it".
 
+A floating window belongs to the row it was floated on. It gives up its column
+so the tiling closes the gap, but the row keeps it: it goes off screen when you
+switch rows, comes back where it was when you return, follows a
+`window_virtualsend*` to another row, and is saved with that row by session
+restore. A row that holds nothing but floats is not collapsed. This is what
+makes a scripted scratchpad — a pad parked on a row you never look at — stay
+put instead of being left behind on screen.
+
 Virtual workspaces can also be navigated using trackpad gestures. If `[swipe.gesture]` is configured, a vertical 3/4-finger swipe will switch between virtual workspace rows, while horizontal swipes continue to scroll the strip as usual. For mouse users, see the `vertical_modifier` option under `[swipe.scroll]`.
 
 | Action | Description |
@@ -355,6 +363,7 @@ The saved session includes:
 - native workspace ids
 - virtual workspace rows and the selected row per native workspace
 - layout structure: singles, stacks, tabs, and fullscreen strips
+- floating windows, with the virtual row they were parked on
 - display/screen association
 - window identity for matching across restarts
 

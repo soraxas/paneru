@@ -323,14 +323,17 @@ pub(crate) fn finish_setup(
             continue;
         };
 
-        // Preserve the order - do not flush existing windows.
-        for entity in strip.all_windows() {
+        // Preserve the order - do not flush existing windows. Detached
+        // (floating, minimised) members count as present: they belong to the
+        // strip without being laid out, so they must neither be dropped here
+        // nor pulled back into a column.
+        for entity in strip.held_windows() {
             if !workspace_windows.iter().any(|(_, e)| *e == entity) {
                 strip.remove(entity);
             }
         }
         for (_, entity) in workspace_windows {
-            if !strip.contains(entity) {
+            if !strip.holds(entity) {
                 strip.append(entity);
             }
         }
