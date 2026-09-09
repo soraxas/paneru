@@ -275,7 +275,18 @@ pub struct ReshuffleAroundMarker;
 /// alone and the entity is free to slide there. Only when the new slot would
 /// fall off the edge does the strip scroll just enough to expose it.
 #[derive(Component)]
-pub struct EnsureVisibleMarker;
+pub struct EnsureVisibleMarker {
+    /// Assign the corrected scroll directly instead of animating toward it.
+    /// Needed for the one-tick-delayed correction issued after a virtual
+    /// workspace restore (`show_active_workspace`): its own `ensure_visible`
+    /// call is skipped on the activation tick by
+    /// `ensure_visible_in_strip`'s `is_added(ActiveWorkspaceMarker)` guard,
+    /// so by the time it actually runs (the next tick), it has no way to
+    /// tell this apart from an ordinary reshuffle-driven correction — which
+    /// must keep animating regardless of `virtual_workspace_animations`.
+    /// `false` for every other caller, which should keep animating.
+    pub snap: bool,
+}
 
 /// Marks a [`LayoutStrip`](crate::ecs::layout::LayoutStrip) whose offset was
 /// placed deliberately by the user (`Operation::Center`, `Operation::Snap`)
@@ -511,6 +522,12 @@ pub trait SpawnCommandsExt {
 
     fn ensure_visible(&mut self, entity: Entity);
 
+    /// Like [`SpawnCommandsExt::ensure_visible`], but `snap` controls whether
+    /// `ensure_visible_in_strip`'s correction is animated or assigned
+    /// directly. Only `show_active_workspace` needs this — everyone else
+    /// wants the correction to keep animating.
+    fn ensure_visible_snap(&mut self, entity: Entity, snap: bool);
+
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
     fn flash_message(&mut self, message: String, duration: f32);
@@ -552,8 +569,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
 
     #[instrument(level = Level::TRACE, skip(self))]
     fn ensure_visible(&mut self, entity: Entity) {
+        self.ensure_visible_snap(entity, false);
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn ensure_visible_snap(&mut self, entity: Entity, snap: bool) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(EnsureVisibleMarker);
+            entity_commands.try_insert(EnsureVisibleMarker { snap });
         }
     }
 

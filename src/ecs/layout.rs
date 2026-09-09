@@ -6,7 +6,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Populated, Query, Res};
+use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
 use std::collections::VecDeque;
 use stdext::function_name;
@@ -14,6 +14,7 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
+use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
@@ -55,6 +56,22 @@ type StripPlacements<'w, 's> = Query<
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+/// A strip, its entity, its own scroll position, whether it's mid-swipe, and
+/// its parent display. Used by [`position_layout_windows`] to build each
+/// window's [`StripWindowContext`].
+type StripsForWindowPositioning<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static Position,
+        Has<Scrolling>,
+        &'static ChildOf,
+    ),
+    With<LayoutStrip>,
+>;
 
 /// Windows whose size or origin changed this tick — either one means the strip
 /// holding them has to re-run its layout.
@@ -1257,32 +1274,53 @@ fn reshuffle_layout_strip(
 /// the per-window animator slides the entity into its slot. Only when the new
 /// slot would fall past an edge does the strip translate, and only by the
 /// shortfall — never to anchor the entity to a particular position.
+#[allow(clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_visible_in_strip(
-    markers: Query<(Entity, &LayoutPosition), With<EnsureVisibleMarker>>,
-    strips: StripPlacements,
+    markers: Query<(Entity, &LayoutPosition, &EnsureVisibleMarker)>,
+    mut strip_params: ParamSet<(
+        StripPlacements,
+        Query<&mut Position, (With<LayoutStrip>, Without<Window>)>,
+    )>,
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    for (entity, layout_position) in markers {
+    for (entity, layout_position, marker) in markers {
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<EnsureVisibleMarker>();
         }
         // Each marker is independent, and its own marker was already consumed
         // above: bailing out of the loop would silently drop the rest.
-        let Some((_, strip_entity, strip_position, child, active_marker, strip_reposition)) =
-            strips.into_iter().find(|s| s.0.contains(entity))
+        // Copied out of the `StripPlacements` borrow so it can be dropped
+        // before the `&mut Position` query below is touched — Bevy treats
+        // the two queries as conflicting system params even though they're
+        // never live at the same time here.
+        let Some((strip_entity, display_entity, strip_target, is_new_activation)) = strip_params
+            .p0()
+            .into_iter()
+            .find(|s| s.0.contains(entity))
+            .map(
+                |(_, strip_entity, strip_position, child, active_marker, strip_reposition)| {
+                    let target = strip_reposition.map_or(strip_position.0, |r| r.0);
+                    (
+                        strip_entity,
+                        child.parent(),
+                        target,
+                        active_marker.is_some_and(|m| m.is_added()),
+                    )
+                },
+            )
         else {
             continue;
         };
 
-        if active_marker.is_some_and(|m| m.is_added()) {
+        if is_new_activation {
             trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");
             continue;
         }
-        let Ok((display, dock)) = displays.get(child.parent()) else {
+        let Ok((display, dock)) = displays.get(display_entity) else {
             continue;
         };
         let Some(size) = windows.size(entity) else {
@@ -1294,7 +1332,6 @@ fn ensure_visible_in_strip(
         // the strip's current position is on its way somewhere else, so the
         // target offset is what the window's slot will actually be measured
         // against - the same projection `reshuffle_layout_strip` makes.
-        let strip_target = strip_reposition.map_or(strip_position.0, |reposition| reposition.0);
         let candidate_min = layout_position.0 + strip_target;
         // Clamp into the viewport. If already on-screen, this is a no-op and
         // the strip target equals its current position — no movement.
@@ -1311,7 +1348,21 @@ fn ensure_visible_in_strip(
         if let Ok(mut cmd) = commands.get_entity(strip_entity) {
             cmd.try_remove::<ManualStripOffset>();
         }
-        commands.reposition_entity(strip_entity, scroll_to);
+        if marker.snap {
+            // This correction is standing in for the virtual-workspace
+            // restore itself (deferred one tick past its `is_added` guard —
+            // see `show_active_workspace`), so it must respect
+            // `virtual_workspace_animations` the same way the restore did,
+            // not always animate like an ordinary reshuffle correction.
+            if let Ok(mut position) = strip_params.p1().get_mut(strip_entity) {
+                position.0 = scroll_to;
+            }
+            if let Ok(mut cmd) = commands.get_entity(strip_entity) {
+                cmd.try_remove::<RepositionMarker>();
+            }
+        } else {
+            commands.reposition_entity(strip_entity, scroll_to);
+        }
     }
 }
 
@@ -1337,14 +1388,20 @@ struct StripWindowContext {
     swiping: bool,
     display_entity: Entity,
     stacked: bool,
+    /// See [`crate::ecs::workspace::SnapStripMarker`]: forces this window to
+    /// snap directly to its target in `position_layout_windows`, bypassing
+    /// the offscreen/parking magnitude heuristic.
+    snap_settling: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_strip_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     strip: &LayoutStrip,
     strip_position: Origin,
     swiping: bool,
     display_entity: Entity,
+    snap_settling: bool,
 ) {
     for column in &strip.columns {
         insert_column_window_contexts(
@@ -1354,10 +1411,12 @@ fn insert_strip_window_contexts(
             swiping,
             display_entity,
             matches!(column, Column::Stack(_)),
+            snap_settling,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_column_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     column: &Column,
@@ -1365,6 +1424,7 @@ fn insert_column_window_contexts(
     swiping: bool,
     display_entity: Entity,
     stacked: bool,
+    snap_settling: bool,
 ) {
     match column {
         Column::Single(entity) | Column::Fullscren(entity) => {
@@ -1375,6 +1435,7 @@ fn insert_column_window_contexts(
                     swiping,
                     display_entity,
                     stacked,
+                    snap_settling,
                 },
             );
         }
@@ -1387,6 +1448,7 @@ fn insert_column_window_contexts(
                     swiping,
                     display_entity,
                     stacked,
+                    snap_settling,
                 );
             }
         }
@@ -1399,6 +1461,7 @@ fn insert_column_window_contexts(
                         swiping,
                         display_entity,
                         stacked,
+                        snap_settling,
                     },
                 );
             }
@@ -1406,6 +1469,7 @@ fn insert_column_window_contexts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_stack_item_window_contexts(
     contexts: &mut EntityHashMap<StripWindowContext>,
     item: &StackItem,
@@ -1413,6 +1477,7 @@ fn insert_stack_item_window_contexts(
     swiping: bool,
     display_entity: Entity,
     stacked: bool,
+    snap_settling: bool,
 ) {
     match item {
         StackItem::Single(entity) => {
@@ -1423,6 +1488,7 @@ fn insert_stack_item_window_contexts(
                     swiping,
                     display_entity,
                     stacked,
+                    snap_settling,
                 },
             );
         }
@@ -1435,6 +1501,7 @@ fn insert_stack_item_window_contexts(
                         swiping,
                         display_entity,
                         stacked,
+                        snap_settling,
                     },
                 );
             }
@@ -1447,7 +1514,8 @@ fn insert_stack_item_window_contexts(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_windows(
     positioned_windows: RepositionedWindows,
-    workspaces: Query<(&LayoutStrip, &Position, Has<Scrolling>, &ChildOf), With<LayoutStrip>>,
+    workspaces: StripsForWindowPositioning,
+    snap_guards: Query<&SnapStripMarker>,
     displays: DisplayViewports,
     config: Res<Config>,
     mut commands: Commands,
@@ -1455,13 +1523,15 @@ fn position_layout_windows(
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
-    for (layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
+    for (strip_entity, layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
+        let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
             *strip_position,
             swiping,
             child_of.parent(),
+            snap_settling,
         );
     }
 
@@ -1557,7 +1627,16 @@ fn position_layout_windows(
             let parking = frame.min.y >= park_row || position.0.y >= park_row;
             let offscreen_move =
                 parking || position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
-            if context.swiping || offscreen_move && !config.virtual_workspace_animations() {
+            // `snap_settling`: a strip restore only fixes the strip's own
+            // offset instantly - a member window (a lower stack member
+            // especially) can still need a correction that neither
+            // `parking` nor the distance threshold recognizes as
+            // restore-driven, since its last position can land close enough
+            // to its target. See `SnapStripMarker`.
+            if context.swiping
+                || context.snap_settling
+                || offscreen_move && !config.virtual_workspace_animations()
+            {
                 position.0 = frame.min;
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_remove::<RepositionMarker>();
@@ -1679,7 +1758,14 @@ mod tests {
         let strip_position = Origin::new(10, 20);
         let mut contexts = EntityHashMap::default();
 
-        insert_strip_window_contexts(&mut contexts, &strip, strip_position, true, display_entity);
+        insert_strip_window_contexts(
+            &mut contexts,
+            &strip,
+            strip_position,
+            true,
+            display_entity,
+            false,
+        );
 
         let stacked_leader = contexts.get(&entities[0]).unwrap();
         let stacked_follower = contexts.get(&entities[1]).unwrap();

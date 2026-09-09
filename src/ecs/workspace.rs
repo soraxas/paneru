@@ -195,6 +195,35 @@ fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
     commands.spawn((timeout, RestoreFocusMarker { entity }));
 }
 
+/// Guard spawned when `show_active_workspace` writes a restored strip's
+/// `Position` directly (`virtual_workspace_animations = false`). That write
+/// only fixes the strip's own aggregate offset instantly; individual member
+/// windows still get re-evaluated by `position_layout_windows` on a
+/// following tick (via `position_layout_strips` reacting to the strip's now
+/// -`Changed<Position>`), using whatever `Position` they were last left at —
+/// which, for a lower stack member parked while its strip was hidden, can
+/// land close enough to its restored target that neither the "offscreen
+/// distance" nor the "parked at the corner" heuristic recognizes it as a
+/// restore-driven move. Left to the ordinary heuristic, that move animates,
+/// riding along even though the strip itself just snapped. While a live
+/// guard names a strip, `position_layout_windows` snaps every member
+/// window directly, bypassing that heuristic entirely. Expires via
+/// `timeout_ticker` like `RestoreFocusMarker`.
+#[derive(Component, Debug)]
+pub(crate) struct SnapStripMarker {
+    pub strip: Entity,
+}
+
+/// Long enough for the settle described above to actually finish (it can
+/// take more than one tick), short enough that an ordinary layout change
+/// shortly after a switch still animates normally.
+const SNAP_STRIP_GUARD_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn spawn_snap_strip_guard(strip: Entity, commands: &mut Commands) {
+    let timeout = Timeout::new(SNAP_STRIP_GUARD_TIMEOUT, None, commands);
+    commands.spawn((timeout, SnapStripMarker { strip }));
+}
+
 fn fullscreen_window_in_strip(
     workspace_id: WorkspaceId,
     strip: &LayoutStrip,
@@ -1360,6 +1389,12 @@ pub(crate) fn show_active_workspace(
             commands.reposition_entity(*activated, origin);
         } else {
             position.0 = origin;
+            // The strip's own offset is fixed instantly, but member windows
+            // (a lower stack member especially) can still need a correction
+            // on a following tick that the ordinary offscreen/parking
+            // heuristic in `position_layout_windows` won't recognize as
+            // restore-driven — see `SnapStripMarker`.
+            spawn_snap_strip_guard(*activated, &mut commands);
         }
 
         if keeps_focus {
@@ -1367,9 +1402,14 @@ pub(crate) fn show_active_workspace(
             // settle over the next frames (widths recomputed, windows the
             // workspace picked up while it was hidden). Re-check the arriving
             // window then: `ensure_visible_in_strip` only scrolls if the slot
-            // it ends up in really falls off an edge.
+            // it ends up in really falls off an edge. That correction fires a
+            // tick after this one (its own `is_added` guard skips the
+            // activation tick), so it must snap rather than animate when
+            // `virtual_workspace_animations` is off — otherwise the strip
+            // (and everything in it) visibly slides on top of the restore
+            // this function just did instantly.
             if let Some(focus_entity) = arriving_focus {
-                commands.ensure_visible(focus_entity);
+                commands.ensure_visible_snap(focus_entity, !config.virtual_workspace_animations());
             }
             return;
         }
