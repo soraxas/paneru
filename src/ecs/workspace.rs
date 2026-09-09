@@ -1014,33 +1014,47 @@ fn switch_virtual_workspace_bind(
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::Virtual(_) | Operation::VirtualNumber(_) | Operation::VirtualAdd
+            Operation::Virtual(_)
+                | Operation::VirtualNumber(_)
+                | Operation::VirtualAdd
+                | Operation::FocusOrVirtual(_)
         )
     })
     .next() else {
         return;
     };
 
-    // North/South first try focusing a window above/below in the current
-    // stack — the same within-column traversal `window_focus_north/south`
-    // itself uses — and only fall through to switching the virtual
-    // workspace when there's nothing to focus that way. This lets
-    // `window_virtual_north/south` double as "focus if possible, else
-    // switch workspace" without touching `window_focus_north/south`'s own
-    // behavior (that one's fallback is cross-display, not cross-workspace).
-    // East/West are deliberately left alone: their existing meaning here is
-    // purely "cycle the virtual workspace index", the same as North/South,
-    // but the focus fallback below would collide with `window_focus_east/
-    // west`'s already-established horizontal cross-column meaning.
-    if let Operation::Virtual(direction @ (Direction::North | Direction::South)) = operation
-        && let Some((_, focused_entity)) = windows.focused()
-        && let Some(target) =
-            get_window_in_direction(direction, focused_entity, active_display.active_strip())
-    {
-        commands.focus_entity(target, true);
-        commands.reshuffle_around(target);
-        return;
-    }
+    // `FocusOrVirtual` is a distinct command from `Operation::Virtual` on
+    // purpose: `window_virtual_north/south` must keep meaning exactly
+    // "switch the virtual workspace", unconditionally, for anyone who binds
+    // it that way — this new command is for callers who explicitly want
+    // "focus a stack neighbor above/below first, and only switch workspace
+    // once there's nothing left to focus", the same within-column traversal
+    // `window_focus_north/south` uses. Only North/South are meaningful here
+    // (there's no "focus" reading of East/West/First/Last/Nth to pair with
+    // a workspace switch); anything else is a no-op. Once the focus check
+    // doesn't apply, this reduces to a plain `Operation::Virtual(direction)`
+    // and falls through to the exact same switching logic below.
+    let synthesized_virtual;
+    let operation = match operation {
+        Operation::FocusOrVirtual(direction @ (Direction::North | Direction::South)) => {
+            if let Some((_, focused_entity)) = windows.focused()
+                && let Some(target) = get_window_in_direction(
+                    direction,
+                    focused_entity,
+                    active_display.active_strip(),
+                )
+            {
+                commands.focus_entity(target, true);
+                commands.reshuffle_around(target);
+                return;
+            }
+            synthesized_virtual = Operation::Virtual(direction.clone());
+            &synthesized_virtual
+        }
+        Operation::FocusOrVirtual(_) => return,
+        operation => operation,
+    };
 
     let workspace_id = active_display.active_strip().id();
     let mut rows = workspaces

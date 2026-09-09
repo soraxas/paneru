@@ -1,7 +1,10 @@
-//! Tests for `window_virtual_north`/`window_virtual_south` acting as "focus
-//! within the current stack if possible, otherwise switch virtual
-//! workspace" — see `switch_virtual_workspace_bind` in
-//! `src/ecs/workspace.rs`.
+//! Tests for `Operation::FocusOrVirtual` (bound as e.g.
+//! `window_virtualfocus_north`/`_south`): focuses a stack neighbor
+//! above/below if one exists, otherwise switches the virtual workspace like
+//! `Operation::Virtual` would — see `switch_virtual_workspace_bind` in
+//! `src/ecs/workspace.rs`. Deliberately a separate command from
+//! `Operation::Virtual` (`window_virtual_north`/`_south`), which must keep
+//! meaning exactly "switch workspace", unconditionally.
 
 use bevy::prelude::*;
 
@@ -22,7 +25,7 @@ fn active_virtual_index(world: &mut World) -> u32 {
 }
 
 #[test]
-fn test_virtual_south_focuses_stack_sibling_before_switching_workspace() {
+fn test_focus_or_virtual_south_focuses_stack_sibling_before_switching_workspace() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -44,10 +47,10 @@ fn test_virtual_south_focuses_stack_sibling_before_switching_workspace() {
             command: Command::Window(Operation::Focus(Direction::First)),
         },
         Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::South)),
+            command: Command::Window(Operation::FocusOrVirtual(Direction::South)),
         },
         Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::South)),
+            command: Command::Window(Operation::FocusOrVirtual(Direction::South)),
         },
     ];
 
@@ -76,14 +79,14 @@ fn test_virtual_south_focuses_stack_sibling_before_switching_workspace() {
 }
 
 #[test]
-fn test_virtual_north_switches_workspace_immediately_without_a_stack() {
+fn test_focus_or_virtual_north_switches_workspace_immediately_without_a_stack() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::VirtualNumber(1)),
         },
         Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::North)),
+            command: Command::Window(Operation::FocusOrVirtual(Direction::North)),
         },
     ];
 
@@ -93,7 +96,50 @@ fn test_virtual_north_switches_workspace_immediately_without_a_stack() {
             assert_eq!(
                 active_virtual_index(world),
                 0,
-                "with no stack sibling to focus, North must switch virtual workspace as before"
+                "with no stack sibling to focus, North must switch virtual workspace"
+            );
+        })
+        .run(commands);
+}
+
+/// Regression: `Operation::Virtual` (`window_virtual_north`/`_south`) must
+/// keep switching the virtual workspace unconditionally, even when the
+/// focused window is in a stack with a focusable neighbor — that
+/// focus-or-switch behavior belongs only to the separate
+/// `Operation::FocusOrVirtual` command.
+#[test]
+fn test_plain_virtual_south_switches_workspace_even_with_a_stack_sibling() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Virtual(Direction::South)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(6, |world, _state| {
+            assert_focused!(world, 0);
+            assert_eq!(
+                active_virtual_index(world),
+                1,
+                "plain Virtual(South) must switch workspace unconditionally, \
+                 not focus the stack sibling"
             );
         })
         .run(commands);

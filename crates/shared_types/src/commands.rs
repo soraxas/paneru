@@ -247,6 +247,13 @@ pub enum Operation {
     Snap,
     /// Cyclically selects the virtual strip for the current workspace.
     Virtual(Direction),
+    /// North/South only: focuses a stack neighbor above/below the focused
+    /// window if one exists (the same within-column traversal as `Focus`),
+    /// otherwise cyclically selects the virtual strip like `Virtual` would.
+    /// A distinct command from `Virtual` so a plain virtual-workspace-switch
+    /// binding keeps meaning exactly that, unconditionally. A no-op on any
+    /// other direction.
+    FocusOrVirtual(Direction),
     /// Selects a virtual strip by its zero-based index for the current workspace.
     VirtualNumber(u32),
     /// Creates a new empty virtual strip after the highest existing one for

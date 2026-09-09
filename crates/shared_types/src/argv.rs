@@ -100,6 +100,9 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         // The `virtual*` verbs take either a direction or a workspace number,
         // and `num` variants that only take a number.
         "virtual" => virtual_target(argument()?, Operation::Virtual, Operation::VirtualNumber)?,
+        // No numeric form: "focus a stack neighbor, else switch" only makes
+        // sense paired with a direction.
+        "virtualfocus" => Operation::FocusOrVirtual(Direction::parse(argument()?)?),
         "virtualnum" => Operation::VirtualNumber(parse_virtual_workspace_number(argument()?)?),
         "virtualadd" => Operation::VirtualAdd,
         "virtualmove" => virtual_target(
@@ -194,6 +197,9 @@ impl Operation {
             Operation::Stack(false) => owned(&["unstack"]),
             Operation::Snap => owned(&["snap"]),
             Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
+            Operation::FocusOrVirtual(direction) => {
+                vec!["virtualfocus".to_string(), direction.token()]
+            }
             Operation::VirtualNumber(index) => {
                 vec!["virtualnum".to_string(), (index + 1).to_string()]
             }
@@ -249,6 +255,8 @@ mod tests {
             Operation::Stack(false),
             Operation::Snap,
             Operation::Virtual(Direction::First),
+            Operation::FocusOrVirtual(Direction::North),
+            Operation::FocusOrVirtual(Direction::South),
             Operation::VirtualNumber(2),
             Operation::VirtualMove(Direction::East, MoveFocus::Follow),
             Operation::VirtualMove(Direction::East, MoveFocus::Stay),
