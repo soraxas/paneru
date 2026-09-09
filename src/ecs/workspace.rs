@@ -17,7 +17,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
-use crate::commands::{Direction, MoveFocus, Operation, filter_window_operations};
+use crate::commands::{
+    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
+};
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
@@ -1003,6 +1005,7 @@ fn mid_strip_slot(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn switch_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
+    windows: Windows,
     active_display: ActiveDisplay,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     config: Res<Config>,
@@ -1017,6 +1020,27 @@ fn switch_virtual_workspace_bind(
     .next() else {
         return;
     };
+
+    // North/South first try focusing a window above/below in the current
+    // stack — the same within-column traversal `window_focus_north/south`
+    // itself uses — and only fall through to switching the virtual
+    // workspace when there's nothing to focus that way. This lets
+    // `window_virtual_north/south` double as "focus if possible, else
+    // switch workspace" without touching `window_focus_north/south`'s own
+    // behavior (that one's fallback is cross-display, not cross-workspace).
+    // East/West are deliberately left alone: their existing meaning here is
+    // purely "cycle the virtual workspace index", the same as North/South,
+    // but the focus fallback below would collide with `window_focus_east/
+    // west`'s already-established horizontal cross-column meaning.
+    if let Operation::Virtual(direction @ (Direction::North | Direction::South)) = operation
+        && let Some((_, focused_entity)) = windows.focused()
+        && let Some(target) =
+            get_window_in_direction(direction, focused_entity, active_display.active_strip())
+    {
+        commands.focus_entity(target, true);
+        commands.reshuffle_around(target);
+        return;
+    }
 
     let workspace_id = active_display.active_strip().id();
     let mut rows = workspaces

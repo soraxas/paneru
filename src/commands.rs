@@ -134,7 +134,7 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
 ///
 /// `Some(Entity)` with the found window's entity, otherwise `None`.
 #[instrument(level = Level::DEBUG, ret)]
-fn get_window_in_direction(
+pub(crate) fn get_window_in_direction(
     direction: &Direction,
     entity: Entity,
     strip: &LayoutStrip,
