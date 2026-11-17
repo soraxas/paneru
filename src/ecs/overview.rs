@@ -128,7 +128,7 @@ struct Search {
 }
 
 /// Where a search refresh puts the selection.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum SearchPick {
     /// The focused window (search just started, or the query is empty):
     /// already in view, so nothing scrolls.
@@ -1113,8 +1113,21 @@ fn overview_key(state: &mut OverviewState, code: u16, text: &str, keys: KeyModif
         return KeyAction::Move(direction);
     }
     let Some(search) = state.search.as_mut() else {
-        if !keys.command && !keys.control && text == "/" {
+        if keys.command || keys.control {
+            return KeyAction::None;
+        }
+        if text == "/" {
             state.search = Some(Search::default());
+            return KeyAction::Query;
+        }
+        // Typing a name starts a search with it. Only letters and digits:
+        // punctuation and Option's symbols aren't how a name starts.
+        if !keys.option && !text.is_empty() && text.chars().all(char::is_alphanumeric) {
+            state.search = Some(Search {
+                query: text.to_owned(),
+                pick: SearchPick::Best,
+                ..Search::default()
+            });
             return KeyAction::Query;
         }
         return KeyAction::None;
@@ -1681,6 +1694,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn typing_a_letter_starts_a_search_with_it() {
+        let none = KeyModifiers {
+            shift: false,
+            command: false,
+            control: false,
+            option: false,
+        };
+        let shift = KeyModifiers {
+            shift: true,
+            ..none
+        };
+        let mut state = OverviewState::default();
+        assert_eq!(overview_key(&mut state, 5, "G", shift), KeyAction::Query);
+        assert_eq!(overview_key(&mut state, 34, "i", none), KeyAction::Query);
+        let search = state.search.as_ref().expect("searching");
+        assert_eq!(search.query, "Gi");
+        assert_eq!(search.pick, SearchPick::Best, "jumps to the best match");
+
+        let mut state = OverviewState::default();
+        assert_eq!(overview_key(&mut state, 18, "1", none), KeyAction::Query);
+        assert_eq!(state.search.as_ref().map(|s| s.query.as_str()), Some("1"));
+    }
+
+    #[test]
     fn overview_keys_search_edit_and_move() {
         const NONE: KeyModifiers = KeyModifiers {
             shift: false,
@@ -1716,10 +1753,14 @@ mod tests {
             key(&mut state, 126, "\u{F700}", NONE),
             KeyAction::Move(Direction::Up)
         );
-        // Only `/` starts a search; Tab and text do nothing until then.
-        assert_eq!(key(&mut state, 0, "a", NONE), KeyAction::None);
+        // `/` starts an empty search; Tab, punctuation, shortcuts and
+        // Option's symbols do nothing until then.
         assert_eq!(key(&mut state, 48, "\t", NONE), KeyAction::None);
+        assert_eq!(key(&mut state, 47, ".", NONE), KeyAction::None);
+        assert_eq!(key(&mut state, 0, "a", CMD), KeyAction::None);
+        assert_eq!(key(&mut state, 0, "å", OPT), KeyAction::None);
         assert_eq!(key(&mut state, 44, "/", CMD), KeyAction::None);
+        assert!(state.search.is_none());
         assert_eq!(key(&mut state, 44, "/", NONE), KeyAction::Query);
         // Once searching, `/` is text (URLs have it).
         for text in ["g", "h", "/"] {
