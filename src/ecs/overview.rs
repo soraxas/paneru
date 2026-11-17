@@ -46,7 +46,7 @@ use crate::overview::view::{
 use crate::overview::{
     Direction, DisplayLayout, Hit, Metrics, OVERVIEW_OPEN, Rect, SPRING_RESPONSE, Spring,
     StripInput, WindowInput, exposing_shift, hit_test, layout_display, middle_row, neighbour,
-    reanchor, release_opens, rubber_band, same_geometry,
+    overview_move, reanchor, release_opens, rubber_band, same_geometry,
 };
 use crate::screen_capture;
 
@@ -176,6 +176,13 @@ impl OverviewState {
 
     pub fn is_active(&self) -> bool {
         self.phase != Phase::Closed
+    }
+
+    /// Whether the overview handles `op` instead of its usual handler: the
+    /// focus commands (see [`overview_move`]) while it is up, so they move
+    /// its selection rather than the real focus behind it.
+    pub fn takes_command(&self, op: &crate::commands::Operation) -> bool {
+        self.is_active() && overview_move(op).is_some()
     }
 
     /// The main loop must keep ticking: a spring runs, or a scrub is in
@@ -432,11 +439,15 @@ fn overview_handler(
                 );
             }
 
-            Event::OverviewMove { direction }
-                if matches!(state.phase, Phase::Open | Phase::Opening) && !state.committed =>
-            {
-                let from = state.selection.map(|m| m.key).or(focused.single().ok());
-                move_selection(&mut state, &mut manager, from, *direction);
+            Event::Command {
+                command: Command::Window(op),
+            } if matches!(state.phase, Phase::Open | Phase::Opening) && !state.committed => {
+                // The focus commands move the selection while open; their
+                // usual handlers leave them alone (see `takes_command`).
+                if let Some(direction) = overview_move(op) {
+                    let from = state.selection.map(|m| m.key).or(focused.single().ok());
+                    move_selection(&mut state, &mut manager, from, direction);
+                }
             }
 
             Event::OverviewKey {

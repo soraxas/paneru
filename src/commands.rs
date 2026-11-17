@@ -437,8 +437,10 @@ fn active_focus_candidate(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_move_focus(
     mut messages: MessageReader<Event>,
+    overview: Option<Res<crate::ecs::overview::OverviewState>>,
     windows: Windows,
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
@@ -446,22 +448,21 @@ fn command_move_focus(
     mut paging: PagingFocusParams,
     mut commands: Commands,
 ) {
-    let Some((direction, is_page)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_)))
-            .find_map(|op| match op {
-                Operation::Focus(direction) => Some((direction.clone(), false)),
-                _ => None,
-            })
-            .or_else(|| {
-                let generation = paging.page_state.generation;
-                let dispatched =
-                    matches!(paging.page_state.in_flight, Some(PageInFlight::Dispatched));
-                paging.page_requests.read().find_map(|req| {
-                    (dispatched && req.generation == generation)
-                        .then(|| (req.direction.clone(), true))
-                })
-            })
-    else {
+    let Some((direction, is_page)) = filter_window_operations(&mut messages, |op| {
+        // The open overview moves its selection with these instead.
+        matches!(op, Operation::Focus(_)) && !overview.as_ref().is_some_and(|o| o.takes_command(op))
+    })
+    .find_map(|op| match op {
+        Operation::Focus(direction) => Some((direction.clone(), false)),
+        _ => None,
+    })
+    .or_else(|| {
+        let generation = paging.page_state.generation;
+        let dispatched = matches!(paging.page_state.in_flight, Some(PageInFlight::Dispatched));
+        paging.page_requests.read().find_map(|req| {
+            (dispatched && req.generation == generation).then(|| (req.direction.clone(), true))
+        })
+    }) else {
         return;
     };
     let direction = &direction;
