@@ -628,7 +628,13 @@ fn write_back(
     for (index, entry) in displays.iter().enumerate() {
         let picked = pick.filter(|pick| pick.display == index);
         let (shown, target) = close_rows(&entry.layout, picked);
-        wrote |= keep_pans(entry, index, strips, windows, commands);
+        // A picked window out of view: the strip goes straight to where it
+        // is exposed (where the cards land), rather than paneru scrolling
+        // it there with an animation once the focus arrives.
+        let expose = picked
+            .and_then(|pick| Some((target?, pick.focus?)))
+            .map(|(row, key)| (row, entry.layout.exposing_points(row, &key)));
+        wrote |= keep_pans(entry, index, strips, windows, commands, expose);
         let Some(target) = target else {
             anchors.push(None);
             continue;
@@ -743,18 +749,23 @@ fn restore_rests(state: &OverviewState, manager: &mut OverviewManager) {
 }
 
 /// Writes each panned row of a display back: the shown row's strip moves,
-/// a hidden row's remembered origin does. Returns whether any row was.
+/// a hidden row's remembered origin does. `expose` adds a further shift, in
+/// points, to one row. Returns whether any row was written.
 fn keep_pans(
     entry: &DisplayEntry,
     index: usize,
     strips: &StripQuery,
     windows: &Windows,
     commands: &mut Commands,
+    expose: Option<(usize, f64)>,
 ) -> bool {
     let mut wrote = false;
     for (row, strip) in entry.layout.strips.iter().enumerate() {
+        let extra = expose
+            .filter(|(at, _)| *at == row)
+            .map_or(0.0, |(_, dx)| dx);
         #[allow(clippy::cast_possible_truncation, reason = "on-screen points")]
-        let dx = entry.layout.pan_points(row).round() as i32;
+        let dx = (entry.layout.pan_points(row) + extra).round() as i32;
         let (Some(&entity), Some(&origin)) = (entry.strips.get(row), entry.origins.get(row)) else {
             continue;
         };
@@ -1410,6 +1421,11 @@ fn open(state: &mut OverviewState, manager: &mut OverviewManager, scene: &Scene)
     );
     // Checked on every open: permission can be granted (or revoked) while
     // paneru runs. Without it, cards show the app icon and title instead.
+    manager.set_ring_style(
+        scene.config.overview_ring_color(),
+        scene.config.overview_ring_width(),
+        scene.config.overview_ring_gap(),
+    );
     manager.set_previews(screen_capture::allowed());
     let labels = card_labels(scene, manager.previews());
     manager.build(&scenes, &info, &labels, 0.0);
@@ -1782,6 +1798,110 @@ mod tests {
             "not a match"
         );
         assert_eq!(stepped(&[], key(1), true), None);
+    }
+
+    #[test]
+    fn a_picked_window_out_of_view_snaps_into_view() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use bevy::ecs::lifecycle::Add;
+        use bevy::ecs::observer::On;
+        use bevy::ecs::system::RunSystemOnce as _;
+
+        use crate::ecs::RepositionMarker;
+        use crate::events::Event;
+        use crate::manager::{Origin, Size};
+        use crate::tests::{
+            TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_PROCESS_ID, TEST_WINDOW_HEIGHT,
+            TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness,
+        };
+
+        let harness = TestHarness::new();
+        let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        // Five 400pt columns on a 1024pt display: the last is out of view.
+        for i in 0..5 {
+            let origin = Origin::new(i * TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            harness.mock_state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                100 + i,
+                bevy::math::IRect::from_corners(origin, origin + size),
+            );
+        }
+        let x_of = |world: &mut bevy::ecs::world::World, id: i32| {
+            let mut windows = world.query::<(&Window, &Position)>();
+            windows
+                .iter(world)
+                .find(|(window, _)| window.id() == id)
+                .map(|(_, position)| position.0.x)
+                .expect("the window")
+        };
+        // Any window or strip starting an animation after the pick.
+        let animated = Arc::new(AtomicBool::new(false));
+        let spy = animated.clone();
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            };
+            2
+        ];
+        harness
+            .on_iteration(0, move |world, _| {
+                let x = x_of(world, 104);
+                assert!(
+                    x + TEST_WINDOW_WIDTH > TEST_DISPLAY_WIDTH,
+                    "out of view: {x}"
+                );
+                let spy = spy.clone();
+                world.add_observer(move |_: On<Add<RepositionMarker>>| {
+                    spy.store(true, Ordering::Relaxed);
+                });
+                world
+                    .run_system_once(|scene: Scene, windows: Windows, mut commands: Commands| {
+                        let entries = gather(&scene, None);
+                        let entry = &entries[0];
+                        let row = entry
+                            .layout
+                            .strips
+                            .iter()
+                            .position(|strip| strip.active)
+                            .expect("a shown row");
+                        let key = entry.layout.strips[row]
+                            .windows
+                            .iter()
+                            .find(|w| w.window_id == 104)
+                            .map(|w| w.key)
+                            .expect("window 104 has a card");
+                        let pick = Pick {
+                            display: 0,
+                            virtual_index: entry.layout.strips[row].virtual_index,
+                            focus: Some(key),
+                        };
+                        // As `select_hit` does it.
+                        write_back(
+                            &entries,
+                            &scene.strips,
+                            &windows,
+                            &mut commands,
+                            Some(&pick),
+                        );
+                        commands.focus_entity(key, true);
+                    })
+                    .expect("commit runs");
+            })
+            .on_iteration(1, move |world, _| {
+                let x = x_of(world, 104);
+                assert!(
+                    (0..=TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH).contains(&x),
+                    "in view: {x}"
+                );
+                assert!(
+                    !animated.load(Ordering::Relaxed),
+                    "got there at once, not by an animation"
+                );
+            })
+            .run(commands);
     }
 
     #[test]
