@@ -178,13 +178,6 @@ impl OverviewState {
         self.phase != Phase::Closed
     }
 
-    /// Whether the overview handles `op` instead of its usual handler: the
-    /// focus commands (see [`overview_move`]) while it is up, so they move
-    /// its selection rather than the real focus behind it.
-    pub fn takes_command(&self, op: &crate::commands::Operation) -> bool {
-        self.is_active() && overview_move(op).is_some()
-    }
-
     /// The main loop must keep ticking: a spring runs, or a scrub is in
     /// progress and its watchdog has to be able to fire.
     pub fn needs_frames(&self) -> bool {
@@ -442,8 +435,9 @@ fn overview_handler(
             Event::Command {
                 command: Command::Window(op),
             } if matches!(state.phase, Phase::Open | Phase::Opening) && !state.committed => {
-                // The focus commands move the selection while open; their
-                // usual handlers leave them alone (see `takes_command`).
+                // The focus commands move the selection while open; the
+                // usual handlers drop every window command meanwhile (see
+                // `commands::WindowCommands`).
                 if let Some(direction) = overview_move(op) {
                     let from = state.selection.map(|m| m.key).or(focused.single().ok());
                     move_selection(&mut state, &mut manager, from, direction);
@@ -1798,6 +1792,78 @@ mod tests {
             "not a match"
         );
         assert_eq!(stepped(&[], key(1), true), None);
+    }
+
+    #[test]
+    fn window_commands_do_nothing_while_the_overview_is_open() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::commands::{Direction as Compass, Operation, ResizeDirection};
+        use crate::events::Event;
+        use crate::tests::TestHarness;
+
+        type Frames = Vec<(i32, bevy::math::IVec2, bevy::math::IVec2)>;
+        let frames = |world: &mut bevy::ecs::world::World| -> Frames {
+            let mut windows = world.query::<(&Window, &Position, &Bounds)>();
+            let mut frames: Frames = windows
+                .iter(world)
+                .map(|(window, position, bounds)| (window.id(), position.0, bounds.0))
+                .collect();
+            frames.sort_unstable_by_key(|frame| frame.0);
+            frames
+        };
+        let focused = |world: &mut bevy::ecs::world::World| {
+            let mut focused = world.query_filtered::<&Window, With<FocusedMarker>>();
+            focused.iter(world).map(|w| w.id()).collect::<Vec<_>>()
+        };
+        let window = |op| Event::Command {
+            command: Command::Window(op),
+        };
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window(Operation::Center),
+            window(Operation::Resize(ResizeDirection::Grow)),
+            window(Operation::Swap(Compass::West)),
+            window(Operation::Focus(Compass::West)),
+            Event::Command {
+                command: Command::PrintState,
+            },
+            window(Operation::Resize(ResizeDirection::Grow)),
+        ];
+        let before = Arc::new(Mutex::new(None));
+        let (record, check) = (before.clone(), before);
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let (record_closed, check_closed) = (closed.clone(), closed);
+        TestHarness::new()
+            .with_windows(3)
+            .on_iteration(0, move |world, _| {
+                *record.lock().unwrap() = Some((frames(world), focused(world)));
+                // Open as far as the command handlers can tell (the harness
+                // has no overview panel to show).
+                world.insert_resource(OverviewState {
+                    phase: Phase::Open,
+                    ..OverviewState::default()
+                });
+            })
+            .on_iteration(4, move |world, _| {
+                let before = check.lock().unwrap().clone().expect("recorded");
+                assert_eq!(
+                    (frames(world), focused(world)),
+                    before,
+                    "nothing behind the open overview moved"
+                );
+                world.remove_resource::<OverviewState>();
+            })
+            .on_iteration(5, move |world, _| {
+                *record_closed.lock().unwrap() = frames(world);
+            })
+            .on_iteration(6, move |world, _| {
+                let closed = check_closed.lock().unwrap().clone();
+                assert_ne!(frames(world), closed, "once closed, a resize works again");
+            })
+            .run(commands);
     }
 
     #[test]

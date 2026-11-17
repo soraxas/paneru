@@ -18,7 +18,8 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::commands::{
-    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
+    Direction, MoveFocus, Operation, WindowCommands, filter_window_operations,
+    get_window_in_direction,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -1127,8 +1128,7 @@ fn mid_strip_slot(
 #[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn switch_virtual_workspace_bind(
-    mut messages: MessageReader<Event>,
-    overview: Option<Res<crate::ecs::overview::OverviewState>>,
+    mut messages: WindowCommands,
     windows: Windows,
     active_display: ActiveDisplay,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
@@ -1143,8 +1143,6 @@ fn switch_virtual_workspace_bind(
                 | Operation::VirtualAdd
                 | Operation::FocusOrVirtual(_)
         )
-            // The open overview moves its selection with these instead.
-            && !overview.as_ref().is_some_and(|o| o.takes_command(op))
     })
     .next() else {
         return;
@@ -1274,7 +1272,7 @@ fn switch_virtual_workspace_bind(
 /// numbered targets always may create, row 0 included.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn move_virtual_workspace_bind(
-    mut messages: MessageReader<Event>,
+    mut messages: WindowCommands,
     windows: Windows,
     active_display: ActiveDisplay,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
