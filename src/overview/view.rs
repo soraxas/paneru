@@ -467,6 +467,65 @@ struct SearchBar {
     text: Retained<CATextLayer>,
     /// "3 matches", on the right.
     count: Retained<CATextLayer>,
+    /// The blinking insertion point, after the typed text.
+    caret: Retained<CALayer>,
+    /// Where the text starts, and how wide it may get, in bar points.
+    text_x: f64,
+    text_w: f64,
+}
+
+impl SearchBar {
+    /// Moves the caret to the end of `query`.
+    fn place_caret(&self, query: &str) {
+        // Before the placeholder when empty, as in a text field.
+        let x = if query.is_empty() {
+            self.text_x - 4.0
+        } else {
+            self.text_x + text_width(query, SEARCH_FONT_SIZE, true).min(self.text_w) + 1.0
+        };
+        let mut frame = self.caret.frame();
+        frame.origin.x = x;
+        self.caret.setFrame(frame);
+    }
+}
+
+/// Width of `text` set in the system font at `size` points.
+fn text_width(text: &str, size: f64, bold: bool) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let font = if bold {
+        NSFont::boldSystemFontOfSize(size)
+    } else {
+        NSFont::systemFontOfSize(size)
+    };
+    let key = NSString::from_str("NSFont");
+    let string = NSString::from_str(text);
+    let size: NSSize = unsafe {
+        let attributes: Retained<AnyObject> =
+            msg_send![class!(NSDictionary), dictionaryWithObject: &*font, forKey: &*key];
+        msg_send![&*string, sizeWithAttributes: &*attributes]
+    };
+    size.width
+}
+
+/// Blinks `layer` on and off like a text caret, until it is removed.
+fn blink(layer: &CALayer) {
+    let path = NSString::from_str("opacity");
+    let values = NSArray::from_retained_slice(&[ns_number(1.0), ns_number(0.0)]);
+    let times = NSArray::from_retained_slice(&[ns_number(0.0), ns_number(0.5)]);
+    let discrete = NSString::from_str("discrete");
+    unsafe {
+        let animation: Retained<AnyObject> =
+            msg_send![class!(CAKeyframeAnimation), animationWithKeyPath: &*path];
+        let _: () = msg_send![&*animation, setValues: &*values];
+        let _: () = msg_send![&*animation, setKeyTimes: &*times];
+        let _: () = msg_send![&*animation, setCalculationMode: &*discrete];
+        let _: () = msg_send![&*animation, setDuration: 1.06_f64];
+        let _: () = msg_send![&*animation, setRepeatCount: f32::INFINITY];
+        let key = NSString::from_str("blink");
+        let _: () = msg_send![layer, addAnimation: &*animation, forKey: &*key];
+    }
 }
 
 fn text_layer(size: f64, bold: bool, scale: f64) -> Retained<CATextLayer> {
@@ -510,8 +569,8 @@ fn search_bar(width: f64, top: f64, scale: f64) -> SearchBar {
     text.setAlignmentMode(unsafe { kCAAlignmentLeft });
     let text_h = SEARCH_FONT_SIZE * 1.3;
     text.setFrame(CGRect::new(
-        CGPoint::new(22.0, (h - text_h) / 2.0),
-        CGSize::new(w - 44.0 - count_w, text_h),
+        CGPoint::new(26.0, (h - text_h) / 2.0),
+        CGSize::new(w - 48.0 - count_w, text_h),
     ));
     bar.addSublayer(&text);
 
@@ -524,7 +583,25 @@ fn search_bar(width: f64, top: f64, scale: f64) -> SearchBar {
         CGSize::new(count_w, count_h),
     ));
     bar.addSublayer(&count);
-    SearchBar { bar, text, count }
+
+    let caret = CALayer::new();
+    let caret_h = SEARCH_FONT_SIZE * 1.2;
+    caret.setFrame(CGRect::new(
+        CGPoint::new(22.0, (h - caret_h) / 2.0),
+        CGSize::new(2.0, caret_h),
+    ));
+    caret.setBackgroundColor(Some(&match_color()));
+    caret.setCornerRadius(1.0);
+    bar.addSublayer(&caret);
+    blink(&caret);
+    SearchBar {
+        bar,
+        text,
+        count,
+        caret,
+        text_x: 26.0,
+        text_w: w - 48.0 - count_w,
+    }
 }
 
 /// Colour of the characters a search matched.
@@ -1160,14 +1237,15 @@ pub struct OverviewManager {
     icons: HashMap<Pid, Option<CFRetained<CGImage>>>,
     /// The search being shown, re-applied to every build.
     search: Option<SearchView>,
+    /// The window the keyboard selection rings, instead of the focused one.
+    selected: Option<i32>,
 }
 
-/// What the window search shows: the query in the search field, matching
-/// cards at full strength (the others dimmed) and the selected one ringed.
+/// What the window search shows: the query in the search field, and the
+/// matching cards at full strength (the others dimmed).
 pub struct SearchView {
     pub query: String,
     pub matched: HashSet<i32>,
-    pub selected: Option<i32>,
     /// What each matching card spells out, by window id.
     pub labels: HashMap<i32, CardMatch>,
 }
@@ -1288,6 +1366,15 @@ impl OverviewManager {
             previews: true,
             icons: HashMap::new(),
             search: None,
+            selected: None,
+        }
+    }
+
+    /// Rings `window_id`'s card (`None`: the focused window's again).
+    pub fn set_selection(&mut self, window_id: Option<i32>) {
+        if self.selected != window_id {
+            self.selected = window_id;
+            self.apply_search();
         }
     }
 
@@ -1321,6 +1408,7 @@ impl OverviewManager {
                     }
                     bar.text
                         .setForegroundColor(Some(&color(1.0, 1.0, 1.0, alpha)));
+                    bar.place_caret(&view.query);
                     // Red edge when nothing matches, blue otherwise.
                     let edge = if !view.query.is_empty() && view.matched.is_empty() {
                         color(1.0, 0.45, 0.45, 1.0)
@@ -1333,13 +1421,13 @@ impl OverviewManager {
                 None => panel.search.bar.setHidden(true),
             }
             for card in &mut panel.cards {
-                let (dim, ring) = match &self.search {
-                    Some(view) => (
-                        !view.matched.contains(&card.window_id),
-                        view.selected == Some(card.window_id),
-                    ),
-                    None => (false, card.focused),
-                };
+                let dim = self
+                    .search
+                    .as_ref()
+                    .is_some_and(|view| !view.matched.contains(&card.window_id));
+                let ring = self
+                    .selected
+                    .map_or(card.focused, |id| id == card.window_id);
                 card.content.setOpacity(if dim { 0.25 } else { 1.0 });
                 card.animated.set_ring(ring);
                 card.animated.layer.setBorderWidth(card.animated.ring);
@@ -1545,7 +1633,7 @@ impl OverviewManager {
             queue,
         );
         self.reveal_since = Some(Instant::now());
-        if self.search.is_some() {
+        if self.search.is_some() || self.selected.is_some() {
             self.apply_search();
         }
         let built = started.elapsed();
@@ -2142,6 +2230,7 @@ impl OverviewManager {
         self.gates = 0;
         self.reveal_since = None;
         self.search = None;
+        self.selected = None;
         debug!(
             "overview: teardown took {:?} (hidden after {hidden:?})",
             started.elapsed()

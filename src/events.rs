@@ -191,6 +191,11 @@ pub enum Event {
         text: String,
         modifiers: KeyModifiers,
     },
+    /// A window-focus hotkey pressed while the overview is open, redirected
+    /// to move its selection (see `overview::redirect_command`).
+    OverviewMove {
+        direction: crate::overview::Direction,
+    },
     /// The overview transition with this generation finished animating.
     OverviewTransitionDone { generation: u64 },
     /// Continuous overview gesture progress: vertical finger travel in
