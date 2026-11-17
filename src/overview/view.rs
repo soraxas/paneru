@@ -39,24 +39,25 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSFont, NSImage, NSPanel, NSScreen,
+    NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSImage, NSPanel, NSScreen,
     NSScreenSaverWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGColor, CGImage, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
 };
-use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSPoint, NSRange, NSRect, NSSize, NSString};
 use objc2_quartz_core::{
     CABasicAnimation, CACurrentMediaTime, CALayer, CAMediaTiming as _, CASpringAnimation,
-    CATextLayer, CATransaction, kCAAlignmentCenter, kCAAlignmentLeft, kCAFillModeForwards,
-    kCAGravityResize, kCAGravityResizeAspect, kCAGravityResizeAspectFill, kCATruncationEnd,
+    CATextLayer, CATransaction, kCAAlignmentCenter, kCAAlignmentLeft, kCAAlignmentRight,
+    kCAFillModeForwards, kCAGravityResize, kCAGravityResizeAspect, kCAGravityResizeAspectFill,
+    kCATruncationEnd,
 };
 use tracing::{debug, warn};
 
 use super::live::{Live, Wanted};
 use super::{DisplayLayout, Rect, Spring};
-use crate::events::{Event, EventSender};
+use crate::events::{Event, EventSender, KeyModifiers};
 use crate::platform::Pid;
 
 /// Blur of the wallpaper backdrop, in points.
@@ -133,11 +134,10 @@ fn cg_image(image: &NSImage) -> Option<CFRetained<CGImage>> {
     std::ptr::NonNull::new(raw).map(|ptr| unsafe { CFRetained::retain(ptr) })
 }
 
-/// The desktop picture file of display `display_id`, if it has one (a
-/// solid colour or a dynamic wallpaper may not).
-fn desktop_picture(mtm: MainThreadMarker, display_id: u32) -> Option<String> {
+/// The `NSScreen` of display `display_id` (a `CGDirectDisplayID`).
+fn ns_screen(mtm: MainThreadMarker, display_id: u32) -> Option<Retained<NSScreen>> {
     let key = NSString::from_str("NSScreenNumber");
-    let screen = NSScreen::screens(mtm).into_iter().find(|screen| {
+    NSScreen::screens(mtm).into_iter().find(|screen| {
         let description = screen.deviceDescription();
         let number: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*description, objectForKey: &*key] };
@@ -145,7 +145,13 @@ fn desktop_picture(mtm: MainThreadMarker, display_id: u32) -> Option<String> {
             let id: u32 = unsafe { msg_send![&*n, unsignedIntValue] };
             id == display_id
         })
-    })?;
+    })
+}
+
+/// The desktop picture file of display `display_id`, if it has one (a
+/// solid colour or a dynamic wallpaper may not).
+fn desktop_picture(mtm: MainThreadMarker, display_id: u32) -> Option<String> {
+    let screen = ns_screen(mtm, display_id)?;
     let workspace: Retained<AnyObject> = unsafe { msg_send![class!(NSWorkspace), sharedWorkspace] };
     let url: Option<Retained<AnyObject>> =
         unsafe { msg_send![&*workspace, desktopImageURLForScreen: &*screen] };
@@ -451,6 +457,195 @@ fn row_label(virtual_index: u32, rect: &Rect, scale: f64) -> Animated {
     Animated::new(Retained::into_super(text), rect, rect, (0.0, 1.0))
 }
 
+/// Size of the search field's text, in points.
+const SEARCH_FONT_SIZE: f64 = 20.0;
+const SEARCH_COUNT_FONT_SIZE: f64 = 13.0;
+
+/// The search field's layers.
+struct SearchBar {
+    bar: Retained<CALayer>,
+    text: Retained<CATextLayer>,
+    /// "3 matches", on the right.
+    count: Retained<CATextLayer>,
+}
+
+fn text_layer(size: f64, bold: bool, scale: f64) -> Retained<CATextLayer> {
+    let text = CATextLayer::new();
+    let font = if bold {
+        NSFont::boldSystemFontOfSize(size)
+    } else {
+        NSFont::systemFontOfSize(size)
+    };
+    // SAFETY: NSFont is toll-free bridged to CTFont, a CF object.
+    let font = unsafe { &*Retained::as_ptr(&font).cast::<objc2_core_foundation::CFType>() };
+    unsafe { text.setFont(Some(font)) };
+    text.setFontSize(size);
+    text.setTruncationMode(unsafe { kCATruncationEnd });
+    text.setContentsScale(scale);
+    text
+}
+
+/// The search field: a rounded bar centred near the top of a panel `width`
+/// points wide, `top` points down (below a notch), above the rows (it
+/// doesn't scroll with them).
+fn search_bar(width: f64, top: f64, scale: f64) -> SearchBar {
+    let (w, h) = (560.0_f64.min(width - 32.0), 46.0);
+    let bar = CALayer::new();
+    bar.setFrame(CGRect::new(
+        CGPoint::new((width - w) / 2.0, top + 12.0),
+        CGSize::new(w, h),
+    ));
+    bar.setBackgroundColor(Some(&color(0.09, 0.10, 0.12, 0.94)));
+    bar.setBorderColor(Some(&match_color()));
+    bar.setBorderWidth(1.5);
+    bar.setCornerRadius(h / 2.0);
+    bar.setShadowColor(Some(&color(0.0, 0.0, 0.0, 1.0)));
+    bar.setShadowOpacity(0.5);
+    bar.setShadowRadius(12.0);
+    bar.setShadowOffset(CGSize::new(0.0, 4.0));
+    bar.setHidden(true);
+
+    let count_w = 110.0;
+    let text = text_layer(SEARCH_FONT_SIZE, true, scale);
+    text.setAlignmentMode(unsafe { kCAAlignmentLeft });
+    let text_h = SEARCH_FONT_SIZE * 1.3;
+    text.setFrame(CGRect::new(
+        CGPoint::new(22.0, (h - text_h) / 2.0),
+        CGSize::new(w - 44.0 - count_w, text_h),
+    ));
+    bar.addSublayer(&text);
+
+    let count = text_layer(SEARCH_COUNT_FONT_SIZE, false, scale);
+    count.setAlignmentMode(unsafe { kCAAlignmentRight });
+    count.setForegroundColor(Some(&color(1.0, 1.0, 1.0, 0.6)));
+    let count_h = SEARCH_COUNT_FONT_SIZE * 1.3;
+    count.setFrame(CGRect::new(
+        CGPoint::new(w - 22.0 - count_w, (h - count_h) / 2.0),
+        CGSize::new(count_w, count_h),
+    ));
+    bar.addSublayer(&count);
+    SearchBar { bar, text, count }
+}
+
+/// Colour of the characters a search matched.
+fn match_color() -> CFRetained<CGColor> {
+    color(0.55, 0.75, 1.0, 1.0)
+}
+
+/// A strip along the bottom of a card naming its app and title, with the
+/// characters the search matched highlighted. Laid out in the card's bounds
+/// space (see [`add_tile`]).
+struct SearchLabel {
+    bar: Retained<CALayer>,
+    app: Retained<CATextLayer>,
+    title: Retained<CATextLayer>,
+    /// Bounds-space length of one point once open.
+    unit: f64,
+}
+
+impl SearchLabel {
+    const APP_FONT: f64 = 14.0;
+    const TITLE_FONT: f64 = 12.5;
+
+    fn new(card: &Animated, scale: f64) -> Self {
+        let unit = card.open_points(1.0);
+        let (w, h) = card.base;
+        let bar_h = (unit * 48.0).min(h);
+        let bar = CALayer::new();
+        bar.setFrame(CGRect::new(
+            CGPoint::new(0.0, h - bar_h),
+            CGSize::new(w, bar_h),
+        ));
+        bar.setBackgroundColor(Some(&color(0.05, 0.06, 0.08, 0.88)));
+        let line = |y: f64, size: f64| {
+            let text = CATextLayer::new();
+            text.setTruncationMode(unsafe { kCATruncationEnd });
+            text.setAlignmentMode(unsafe { kCAAlignmentLeft });
+            // Rendered at its size on screen, not at the window's: the card
+            // scales it down, and big windows would make huge textures.
+            text.setContentsScale(scale / unit.max(f64::EPSILON));
+            text.setFrame(CGRect::new(
+                CGPoint::new(unit * 8.0, y),
+                CGSize::new((w - unit * 16.0).max(1.0), unit * size * 1.3),
+            ));
+            bar.addSublayer(&text);
+            text
+        };
+        let app = line(unit * 5.0, Self::APP_FONT);
+        let title = line(unit * 25.0, Self::TITLE_FONT);
+        card.layer.addSublayer(&bar);
+        Self {
+            bar,
+            app,
+            title,
+            unit,
+        }
+    }
+
+    fn show(&self, label: &CardMatch) {
+        let text = |layer: &CATextLayer, string: &str, hits: &[usize], size: f64, bold: bool| {
+            let string = highlighted(string, hits, self.unit * size, bold);
+            unsafe { layer.setString(Some(&string)) };
+        };
+        text(&self.app, &label.app, &label.app_hits, Self::APP_FONT, true);
+        text(
+            &self.title,
+            &label.title,
+            &label.title_hits,
+            Self::TITLE_FONT,
+            false,
+        );
+        self.bar.setHidden(false);
+    }
+}
+
+/// `text` at `size` points, with the characters at `hits` (char indices)
+/// bold and in [`match_color`].
+fn highlighted(text: &str, hits: &[usize], size: f64, bold: bool) -> Retained<AnyObject> {
+    let string = NSString::from_str(text);
+    let attributed: Retained<AnyObject> = unsafe {
+        msg_send![
+            msg_send![class!(NSMutableAttributedString), alloc],
+            initWithString: &*string
+        ]
+    };
+    // CoreText's keys: what CATextLayer draws with.
+    let font_key = NSString::from_str("NSFont");
+    let color_key = NSString::from_str("CTForegroundColor");
+    let cf = |object: &objc2_core_foundation::CFType| -> *const AnyObject {
+        std::ptr::from_ref(object).cast()
+    };
+    let add = |key: &NSString, value: *const AnyObject, range: NSRange| {
+        let _: () =
+            unsafe { msg_send![&*attributed, addAttribute: key, value: value, range: range] };
+    };
+    let regular = if bold {
+        NSFont::boldSystemFontOfSize(size)
+    } else {
+        NSFont::systemFontOfSize(size)
+    };
+    let hit_font = NSFont::boldSystemFontOfSize(size);
+    let plain = color(1.0, 1.0, 1.0, if bold { 1.0 } else { 0.88 });
+    let accent = match_color();
+    let all = NSRange::new(0, string.length());
+    add(&font_key, Retained::as_ptr(&regular).cast(), all);
+    add(&color_key, cf(&plain), all);
+    // Char indices to UTF-16 ranges.
+    let mut offset = 0;
+    let mut hits = hits.iter().peekable();
+    for (i, c) in text.chars().enumerate() {
+        let len = c.len_utf16();
+        if hits.peek() == Some(&&i) {
+            hits.next();
+            let range = NSRange::new(offset, len);
+            add(&font_key, Retained::as_ptr(&hit_font).cast(), range);
+            add(&color_key, cf(&accent), range);
+        }
+        offset += len;
+    }
+    attributed
+}
+
 /// A card without a preview: a plain tile with the app icon and the window
 /// title in the middle. Sized in `card`'s bounds space (the window's real
 /// size, scaled down by the card's transform), so it reads the same on
@@ -754,10 +949,24 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            let sender = &self.ivars().sender;
             match event.keyCode() {
-                53 => _ = self.ivars().sender.send(Event::OverviewDismiss),
-                36 => _ = self.ivars().sender.send(Event::OverviewAccept),
-                _ => {}
+                53 => _ = sender.send(Event::OverviewDismiss),
+                36 | 76 => _ = sender.send(Event::OverviewAccept),
+                code => {
+                    let flags = event.modifierFlags();
+                    let text = event.characters().map(|s| s.to_string()).unwrap_or_default();
+                    _ = sender.send(Event::OverviewKey {
+                        code,
+                        text,
+                        modifiers: KeyModifiers {
+                            shift: flags.contains(NSEventModifierFlags::Shift),
+                            command: flags.contains(NSEventModifierFlags::Command),
+                            control: flags.contains(NSEventModifierFlags::Control),
+                            option: flags.contains(NSEventModifierFlags::Option),
+                        },
+                    });
+                }
             }
         }
     }
@@ -800,6 +1009,10 @@ define_class!(
 
 struct Card {
     animated: Animated,
+    /// Carries the focus ring when no search selection does.
+    focused: bool,
+    /// App name and title with the search's matches, made on first use.
+    search_label: Option<SearchLabel>,
     /// The window's snapshot.
     content: Retained<CALayer>,
     window_id: i32,
@@ -869,6 +1082,8 @@ struct Panel {
     container: Animated,
     rows: Vec<RowLayers>,
     cards: Vec<Card>,
+    /// The search field (`/`), hidden unless searching.
+    search: SearchBar,
     /// The display's backing scale (pixels per point).
     scale: f64,
 }
@@ -943,6 +1158,27 @@ pub struct OverviewManager {
     previews: bool,
     /// App icons by process id, for the tiles.
     icons: HashMap<Pid, Option<CFRetained<CGImage>>>,
+    /// The search being shown, re-applied to every build.
+    search: Option<SearchView>,
+}
+
+/// What the window search shows: the query in the search field, matching
+/// cards at full strength (the others dimmed) and the selected one ringed.
+pub struct SearchView {
+    pub query: String,
+    pub matched: HashSet<i32>,
+    pub selected: Option<i32>,
+    /// What each matching card spells out, by window id.
+    pub labels: HashMap<i32, CardMatch>,
+}
+
+/// A matching window's app name and title, and the characters of each the
+/// query matched (highlighted on its card).
+pub struct CardMatch {
+    pub app: String,
+    pub title: String,
+    pub app_hits: Vec<usize>,
+    pub title_hits: Vec<usize>,
 }
 
 /// How long scrolling has to rest before the live streams follow it: while
@@ -1051,7 +1287,79 @@ impl OverviewManager {
             live_wake: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             previews: true,
             icons: HashMap::new(),
+            search: None,
         }
+    }
+
+    /// Shows `view` (or ends the search with `None`).
+    pub fn set_search(&mut self, view: Option<SearchView>) {
+        self.search = view;
+        self.apply_search();
+    }
+
+    fn apply_search(&mut self) {
+        CATransaction::begin();
+        CATransaction::setAnimationDuration(0.12);
+        for panel in &mut self.panels {
+            match &self.search {
+                Some(view) => {
+                    let bar = &panel.search;
+                    let (text, alpha) = if view.query.is_empty() {
+                        ("Search windows by title or app".to_owned(), 0.55)
+                    } else {
+                        (view.query.clone(), 1.0)
+                    };
+                    let count = match (view.query.is_empty(), view.matched.len()) {
+                        (true, _) => String::new(),
+                        (false, 0) => "No matches".to_owned(),
+                        (false, 1) => "1 match".to_owned(),
+                        (false, n) => format!("{n} matches"),
+                    };
+                    unsafe {
+                        bar.text.setString(Some(&NSString::from_str(&text)));
+                        bar.count.setString(Some(&NSString::from_str(&count)));
+                    }
+                    bar.text
+                        .setForegroundColor(Some(&color(1.0, 1.0, 1.0, alpha)));
+                    // Red edge when nothing matches, blue otherwise.
+                    let edge = if !view.query.is_empty() && view.matched.is_empty() {
+                        color(1.0, 0.45, 0.45, 1.0)
+                    } else {
+                        match_color()
+                    };
+                    bar.bar.setBorderColor(Some(&edge));
+                    bar.bar.setHidden(false);
+                }
+                None => panel.search.bar.setHidden(true),
+            }
+            for card in &mut panel.cards {
+                let (dim, ring) = match &self.search {
+                    Some(view) => (
+                        !view.matched.contains(&card.window_id),
+                        view.selected == Some(card.window_id),
+                    ),
+                    None => (false, card.focused),
+                };
+                card.content.setOpacity(if dim { 0.25 } else { 1.0 });
+                card.animated.set_ring(ring);
+                card.animated.layer.setBorderWidth(card.animated.ring);
+                let label = self
+                    .search
+                    .as_ref()
+                    .and_then(|view| view.labels.get(&card.window_id));
+                match (label, &card.search_label) {
+                    (Some(label), Some(layers)) => layers.show(label),
+                    (Some(label), None) => {
+                        let layers = SearchLabel::new(&card.animated, panel.scale);
+                        layers.show(label);
+                        card.search_label = Some(layers);
+                    }
+                    (None, Some(layers)) => layers.bar.setHidden(true),
+                    (None, None) => {}
+                }
+            }
+        }
+        CATransaction::commit();
     }
 
     /// Turns window capture on or off (see [`Self::previews`]); applies from
@@ -1237,6 +1545,9 @@ impl OverviewManager {
             queue,
         );
         self.reveal_since = Some(Instant::now());
+        if self.search.is_some() {
+            self.apply_search();
+        }
         let built = started.elapsed();
         self.sync_live();
         let synced = started.elapsed();
@@ -1573,6 +1884,8 @@ impl OverviewManager {
                 };
                 let entry = Card {
                     animated: card,
+                    focused: window.focused,
+                    search_label: None,
                     content,
                     window_id: window.window_id,
                     best: strip.active,
@@ -1604,9 +1917,15 @@ impl OverviewManager {
         }
         tiled.extend(floating);
 
+        // Below the camera housing on displays with a notch.
+        let notch = ns_screen(mtm, scene.display_id).map_or(0.0, |s| s.safeAreaInsets().top);
+        let search = search_bar(b.w, notch, scale);
+        flipped.addSublayer(&search.bar);
+
         Some(Panel {
             window,
             window_number,
+            search,
             root: flipped,
             backdrop,
             tint,
@@ -1822,6 +2141,7 @@ impl OverviewManager {
         self.outstanding = 0;
         self.gates = 0;
         self.reveal_since = None;
+        self.search = None;
         debug!(
             "overview: teardown took {:?} (hidden after {hidden:?})",
             started.elapsed()

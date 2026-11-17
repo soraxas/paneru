@@ -10,6 +10,7 @@
 //! top-left corner), matching CG screen coordinates minus the display origin.
 
 mod live;
+pub mod search;
 pub mod view;
 
 /// Display-local, Y-down rectangle in points.

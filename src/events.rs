@@ -44,6 +44,16 @@ pub type Reply = async_channel::Sender<Response>;
 #[derive(Clone, Debug, Message)]
 pub struct InputEvent(pub Event);
 
+/// Modifier keys held with an overview key press.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools, reason = "one flag per modifier key")]
+pub struct KeyModifiers {
+    pub shift: bool,
+    pub command: bool,
+    pub control: bool,
+    pub option: bool,
+}
+
 /// Several variants carry a payload used only by the Lua bridge
 /// (`src/lua/convert.rs`). The dead-code lint is suppressed only when the
 /// `lua` feature is off, so it still applies to the build that ships.
@@ -174,6 +184,13 @@ pub enum Event {
     /// Return pressed while an overview panel had key focus: close into
     /// what the overview shows.
     OverviewAccept,
+    /// Any other key pressed while an overview panel had key focus (the
+    /// window search). `text` is what the key types.
+    OverviewKey {
+        code: u16,
+        text: String,
+        modifiers: KeyModifiers,
+    },
     /// The overview transition with this generation finished animating.
     OverviewTransitionDone { generation: u64 },
     /// Continuous overview gesture progress: vertical finger travel in
